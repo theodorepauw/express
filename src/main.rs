@@ -1,5 +1,6 @@
 extern crate futures;
 extern crate open;
+extern crate rayon;
 extern crate reqwest;
 extern crate rusqlite;
 extern crate serde;
@@ -13,6 +14,7 @@ use clap::{App, Arg, SubCommand};
 use futures::{future::ok, Future, Stream};
 
 use reqwest::r#async::{Client, Response};
+#[allow(unused_imports)]
 use rusqlite::{Connection, NO_PARAMS};
 use std::path::PathBuf;
 use walkdir::{DirEntry, WalkDir};
@@ -34,6 +36,8 @@ struct FilmInfo {
     Poster: String,
     #[serde(default)]
     imdbRating: String,
+    #[serde(default)]
+    imdbID: String,
     #[serde(default)]
     Response: String,
 }
@@ -95,14 +99,15 @@ fn get_films(location: String, output: crossbeam_channel::Sender<Film>) {
             });
     });
 
-    // let (fs, fr) = crossbeam_channel::unbounded();
     tokio::run(
         futures::stream::iter_ok(r.into_iter())
             .map(move |(title, path)| (get_resp(title), ok(()).map(|_| path)))
             .buffer_unordered(400)
             .for_each(move |(i, p)| {
                 if &i.Response[0..1] == "T" {
-                    output.send(Film { info: i, path: p }).unwrap();
+                    if let Err(e) = output.send(Film { info: i, path: p }) {
+                        eprintln!("{}", e);
+                    }
                 } else {
                     eprintln!(
                         "No movie found for `{}`! Please check that the file is named correctly.",
@@ -113,7 +118,43 @@ fn get_films(location: String, output: crossbeam_channel::Sender<Film>) {
             })
             .map_err(|e| eprintln!("Error: {}", e)),
     );
-    // fr.iter().map(|(i, p)| Film {path: p, info: i}).collect()
+}
+
+fn save_in_database(input: &crossbeam_channel::Receiver<Film>) -> Result<(), rusqlite::Error> {
+    let mut conn = Connection::open("orbit.sqlite")?;
+
+    conn.execute_batch("
+    BEGIN;
+    CREATE TABLE IF NOT EXISTS MOVIES (id integer not null primary key, path text not null unique, title text, year int, plot text, rating int, imdbID text, poster_url text);
+    CREATE TABLE IF NOT EXISTS GENRES (id integer not null primary key, genre text not null unique);
+    CREATE TABLE IF NOT EXISTS MOVIEGENRES (genre_id integer, movie_id integer, FOREIGN KEY(movie_id) REFERENCES MOVIES (id) ON DELETE CASCADE, FOREIGN KEY(genre_id) REFERENCES GENRES (id));
+    COMMIT;
+    ",)?;
+
+    println!();
+    let (s, r) = crossbeam_channel::unbounded();
+    std::thread::spawn(move || {
+        let mut i = 1;
+        r.iter().for_each(|f: Film| { println!("{}. {}", i, f.info); i += 1; });
+    });
+
+    let tx = conn.transaction()?;
+    input.iter().for_each(|f| {
+        if let Ok(mut stmt) = tx.prepare_cached("INSERT OR IGNORE INTO MOVIES (path, title, year, plot, rating, imdbID, poster_url) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)") {
+            if let Err(e) = stmt.execute(&[&f.path, &f.info.Title, &f.info.Year, &f.info.Plot, &f.info.imdbRating, &f.info.imdbID, &f.info.Poster]) {
+                eprintln!("{}", e);
+            } else {
+                if let Err(e) = s.send(f) {
+                    eprintln!("{}", e);
+                }
+            }
+        }   
+    });
+    drop(s);
+    tx.commit()?;
+
+    println!("\nDatabase `orbit.sqlite` created.");
+    Ok(())
 }
 
 fn main() -> Result<(), ()> {
@@ -141,12 +182,13 @@ fn main() -> Result<(), ()> {
         )
         .subcommand(
             SubCommand::with_name("search")
-            .arg(
-                Arg::with_name("titles")
-                .required(true)
-                .multiple(true)
-                .help("Movies to search for"),
-            ).help("Lookup movie details"),
+                .arg(
+                    Arg::with_name("titles")
+                        .required(true)
+                        .multiple(true)
+                        .help("Movies to search for"),
+                )
+                .help("Lookup movie details"),
         )
         .arg(
             Arg::with_name("database")
@@ -155,47 +197,52 @@ fn main() -> Result<(), ()> {
                 .default_value("val: &'a str"),
         )
         .get_matches();
-   
-    let conn = Connection::open("orbit.db").expect("Couldn't open `orbit.db`");
-    conn.execute("CREATE TABLE IF NOT EXISTS MOVIES (id integer not null primary key, path text not null unique, title text, year int, plot text, rating int, poster_url text);", NO_PARAMS,).expect("Couldn't create table `MOVIES`");
-    conn.execute("CREATE TABLE IF NOT EXISTS GENRES (id integer not null primary key, genre text not null unique);", NO_PARAMS,).expect("Couldn't create table `GENRES`");
-    conn.execute("CREATE TABLE IF NOT EXISTS MOVIEGENRES (genre_id integer, movie_id integer, FOREIGN KEY(movie_id) REFERENCES MOVIES (id) ON DELETE CASCADE,
-	 FOREIGN KEY(genre_id) REFERENCES GENRES (id));", NO_PARAMS,).expect("Couldn't create table `MOVIEGENRES`");
 
+    let cli = true;
 
-    if let Some(update_matches) = matches.subcommand_matches("update") {    
+    if let Some(update_matches) = matches.subcommand_matches("update") {
         let location = update_matches
-        .value_of("location")
-        .expect("Invalid location. Please double check and wrap in quotes.");
+            .value_of("location")
+            .expect("Invalid location. Please double check and wrap in quotes.");
 
         let (tx, rx) = crossbeam_channel::unbounded();
         get_films(location.to_string(), tx);
-        println!();
-        let mut i = 1;
-        let mut films = Vec::new();
-        rx.iter().for_each(|f| {
-            println!("{}. {}", i, &f.info);
-            films.push(f);
-            i += 1;
-        });
-
-        println!("\nType your selection!\n");
-        let mut input = String::new();
-        match std::io::stdin().read_line(&mut input) {
-            Ok(_) => match input.trim().parse::<usize>() {
-                Ok(index) if index <= films.len() => {
-                    let i = index - 1;
-                    println!("\n{}\n\n{}", &films[i].info, &films[i].path);
-                    if let Err(e) = open::that(&films[i].path) {
-                        eprintln!("{}", e);
-                    }
-                }
-                _ => println!("Ok! Nothing to be done."),
-            },
-            Err(e) => eprintln!("{}", e),
+        if cli {
+            if save_in_database(&rx).is_err() {
+                eprintln!("Couldn't save anything in the database!");
+            };
+            println!();
         }
+    // let mut i = 1;
+    // let mut films = Vec::new();
+    // rx.iter().for_each(|f| {
+    //     println!("{}. {}", i, &f.info);
+    //     films.push(f);
+    //     i += 1;
+    // });
+
+    // println!("\nType your selection!\n");
+    // let mut input = String::new();
+    // match std::io::stdin().read_line(&mut input) {
+    //     Ok(_) => match input.trim().parse::<usize>() {
+    //         Ok(index) if index <= films.len() => {
+    //             let i = index - 1;
+    //             println!("\n{}\n\n{}", &films[i].info, &films[i].path);
+    //             if let Err(e) = open::that(&films[i].path) {
+    //                 eprintln!("{}", e);
+    //             }
+    //         }
+    //         _ => println!("Ok! Nothing to be done."),
+    //     },
+    //     Err(e) => eprintln!("{}", e),
+    // }
     } else if let Some(search_matches) = matches.subcommand_matches("search") {
-        search_matches.values_of("titles").expect("No movies specified for search...").for_each(move |t| { dbg!(t); });
+        search_matches
+            .values_of("titles")
+            .expect("No movies specified for search...")
+            .for_each(move |t| {
+                dbg!(t);
+            });
     }
 
     Ok(())
