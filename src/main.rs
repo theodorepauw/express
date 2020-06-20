@@ -70,6 +70,7 @@ fn is_valid_entry(entry: DirEntry) -> Option<(String, String)> {
 }
 
 fn get_films(location: String, output: crossbeam_channel::Sender<Film>) {
+    // obviously, I should actually use a secrets file.
     let base_url = "https://www.omdbapi.com/?apikey=1d4b6bb0&t=";
     let client = Client::new();
     let (s, r) = crossbeam_channel::unbounded();
